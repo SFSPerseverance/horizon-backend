@@ -48,7 +48,10 @@ const limiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
 });
-app.use('/api/', limiter);
+app.use('/api/', (req, res, next) => {
+  if (req.path === '/aircraft') return next(); // let aircraft route use aircraftLimiter only
+  return limiter(req, res, next);
+});
 
 // Separate rate limiter for aircraft updates (more lenient for game servers)
 const aircraftLimiter = rateLimit({
