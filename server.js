@@ -1,11 +1,14 @@
-// server.js (your original file + login/register API)
+// server.js (DB-free version)
+// Reworked to remove dependency on ./db.js — uses in-memory + file-backed local stores.
+// NOTE: This is fine for development / small deployments. For production you should
+// reintroduce a persistent DB or an external store (Redis/Postgres).
+
 import express from 'express';
 import helmet from 'helmet';
 import cors from 'cors';
 import rateLimit from 'express-rate-limit';
 import dotenv from 'dotenv';
 import { z } from 'zod';
-import { initDb, upsertCode, verifyCode, getStatus, pruneExpired } from './db.js';
 import aircraftService from './aircraftService.js';
 
 import { promises as fs } from 'fs';
@@ -80,35 +83,12 @@ function generateCode() {
 }
 
 /* =========================
-   New: simple user store fallback + password hashing helpers
-   - If your ./db.js exposes user functions (createUser, getUserById, verifyUserPassword),
-     the endpoints will use those. Otherwise we use a local file-based store at ./data/users.json
+   Local file-backed user store + password hashing helpers
+   (keeps your existing behavior, DB removed)
    ========================= */
 
 const DATA_DIR = path.resolve('./data');
 const USERS_FILE = path.join(DATA_DIR, 'users.json');
-
-// In-memory token store (simple). For production, consider JWT or persistent session store.
-const tokenStore = new Map();
-
-function randomToken() {
-  return crypto.randomBytes(32).toString('hex');
-}
-
-function hashPassword(password) {
-  const salt = crypto.randomBytes(16).toString('hex');
-  const derived = crypto.scryptSync(password, salt, 64).toString('hex');
-  return `${salt}$${derived}`;
-}
-
-function verifyPassword(stored, password) {
-  if (!stored || typeof stored !== 'string') return false;
-  const [salt, derived] = stored.split('$');
-  if (!salt || !derived) return false;
-  const check = crypto.scryptSync(password, salt, 64).toString('hex');
-  // constant-time compare
-  return crypto.timingSafeEqual(Buffer.from(check, 'hex'), Buffer.from(derived, 'hex'));
-}
 
 async function ensureDataDir() {
   try {
@@ -157,6 +137,86 @@ async function localSetVerified(userId, v = true) {
   return true;
 }
 
+// In-memory token store (simple). For production, consider JWT or persistent session store.
+const tokenStore = new Map();
+
+function randomToken() {
+  return crypto.randomBytes(32).toString('hex');
+}
+
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const derived = crypto.scryptSync(password, salt, 64).toString('hex');
+  return `${salt}$${derived}`;
+}
+
+function verifyPassword(stored, password) {
+  if (!stored || typeof stored !== 'string') return false;
+  const [salt, derived] = stored.split('$');
+  if (!salt || !derived) return false;
+  const check = crypto.scryptSync(password, salt, 64).toString('hex');
+  // constant-time compare
+  return crypto.timingSafeEqual(Buffer.from(check, 'hex'), Buffer.from(derived, 'hex'));
+}
+
+/* =========================
+   In-memory verification code store (replaces DB)
+   Structure: codes = Map<userId, { code, expiresAt }>
+   ========================= */
+
+const codes = new Map(); // userId -> { code, expiresAt }
+
+async function upsertCode(userId, code, ttlMinutes = TTL_MIN) {
+  const now = Date.now();
+  const expiresAt = now + Math.max(1, Number(ttlMinutes)) * 60 * 1000;
+  codes.set(userId, { code: String(code), expiresAt });
+  // return a row-like object for compatibility
+  return { userId, code: String(code), expiresAt };
+}
+
+async function verifyCode(userId, code) {
+  const rec = codes.get(userId);
+  if (!rec) return false;
+  const now = Date.now();
+  if (now > rec.expiresAt) {
+    codes.delete(userId);
+    return false;
+  }
+  if (String(code) !== String(rec.code)) return false;
+  // mark user verified in local store if exists
+  try {
+    await localSetVerified(userId, true);
+  } catch (e) {
+    // ignore
+  }
+  // consume the code
+  codes.delete(userId);
+  return true;
+}
+
+async function getStatus(userId) {
+  // returns { verified: boolean }
+  const user = await localGetUser(userId);
+  if (user && user.verified) return { verified: true };
+  // otherwise not verified
+  return { verified: false };
+}
+
+async function pruneExpired() {
+  const now = Date.now();
+  const removed = [];
+  for (const [uid, obj] of codes.entries()) {
+    if (now > obj.expiresAt) {
+      codes.delete(uid);
+      removed.push(uid);
+    }
+  }
+  if (removed.length) {
+    console.log('Pruned expired verification codes:', removed.length);
+  }
+  return removed;
+}
+
 /* =========================
    Routes: verification / aircraft (existing)
    ========================= */
@@ -191,17 +251,7 @@ app.post('/api/verify', async (req, res) => {
     const { userId, code } = bodySchema.parse(req.body);
     const ok = await verifyCode(userId, code);
 
-    // If using local fallback users, mark them verified here too
-    if (ok) {
-      try {
-        // if db.js provides a createUser/getUserById/verifyUser implementation, you may want to hook into it.
-        // As a fallback, update local store.
-        await localSetVerified(userId, true);
-      } catch (e) {
-        // ignore
-      }
-    }
-
+    // If using local fallback users, mark them verified here too (verifyCode already does this)
     res.json({ ok: true, verified: ok });
   } catch (e) {
     console.error(e);
@@ -217,7 +267,7 @@ app.get('/api/verify-status', async (req, res) => {
       return res.status(400).json({ ok: false, error: 'invalid_user' });
     }
     const status = await getStatus(userId);
-    // getStatus is expected to return something like { verified: boolean }
+    // getStatus returns { verified: boolean }
     res.json({ ok: true, ...status });
   } catch (e) {
     console.error(e);
@@ -241,30 +291,15 @@ app.post('/api/users', async (req, res) => {
   try {
     const { userId, password } = RegisterSchema.parse(req.body);
 
-    // Try to use DB-level createUser if available
+    // Use only local file store (DB removed)
     let createdUser = null;
     try {
-      // If your db.js exports createUser, call it (expected interface: createUser(userId, passwordHash) or similar)
-      // We'll check for exported function dynamically
-      const dbModule = await import('./db.js');
-      if (typeof dbModule.createUser === 'function') {
-        // attempt to create user in DB (let DB handle hashing or storage)
-        createdUser = await dbModule.createUser(userId, password);
-      }
+      createdUser = await localCreateUser(userId, password);
     } catch (e) {
-      // ignore, fallback to local file store
-    }
-
-    if (!createdUser) {
-      // fallback local create (throws if already exists)
-      try {
-        createdUser = await localCreateUser(userId, password);
-      } catch (e) {
-        if (e.message === 'exists') {
-          return res.status(409).json({ ok: false, error: 'user_exists' });
-        }
-        throw e;
+      if (e.message === 'exists') {
+        return res.status(409).json({ ok: false, error: 'user_exists' });
       }
+      throw e;
     }
 
     // create verification code (so the same verification pipeline works)
@@ -299,82 +334,37 @@ app.post('/api/login', async (req, res) => {
   try {
     const { userId, password } = LoginSchema.parse(req.body);
 
-    // 1) Try DB-level verification if db.js provides an accessor
-    let userRecord = null;
-    let dbUsed = false;
-    try {
-      const dbModule = await import('./db.js');
-      if (typeof dbModule.getUserById === 'function') {
-        userRecord = await dbModule.getUserById(userId);
-        dbUsed = true;
-      } else if (typeof dbModule.findUser === 'function') {
-        userRecord = await dbModule.findUser(userId);
-        dbUsed = true;
-      }
-    } catch (e) {
-      // ignore, fallback to local
-    }
-
-    // 2) If no db user, fallback to local file
-    if (!userRecord) {
-      userRecord = await localGetUser(userId);
-    }
+    // Use local file store only (DB removed)
+    let userRecord = await localGetUser(userId);
 
     if (!userRecord) {
       return res.status(401).json({ ok: false, error: 'invalid_credentials' });
     }
 
-    // If DB exposes verifyUserPassword we prefer it (maybe DB stores bcrypt)
+    // verify password
     let passwordOk = false;
-    try {
-      const dbModule = await import('./db.js');
-      if (typeof dbModule.verifyUserPassword === 'function') {
-        passwordOk = await dbModule.verifyUserPassword(userId, password);
-      }
-    } catch (e) {
-      // ignore
-    }
-
-    // fallback to comparing local passwordHash
-    if (!passwordOk) {
-      if (userRecord.passwordHash) {
-        passwordOk = verifyPassword(userRecord.passwordHash, password);
-      } else if (!dbUsed && userRecord.password) {
-        // legacy plain password field (not recommended) - support during migration
-        passwordOk = (userRecord.password === password);
-      } else {
-        // if no way to verify password, reject
-        passwordOk = false;
-      }
+    if (userRecord.passwordHash) {
+      passwordOk = verifyPassword(userRecord.passwordHash, password);
+    } else if (userRecord.password) {
+      // legacy plain password (not recommended)
+      passwordOk = (userRecord.password === password);
+    } else {
+      passwordOk = false;
     }
 
     if (!passwordOk) {
       return res.status(401).json({ ok: false, error: 'invalid_credentials' });
     }
 
-    // 3) Check verification status: prefer getStatus() from your db logic
-    let verified = false;
-    try {
-      const status = await getStatus(userId);
-      if (status && status.verified) verified = true;
-    } catch (e) {
-      // ignore; fallback to local user record's verified field
-    }
-
-    if (!verified) {
-      // fallback local store check
-      if (userRecord.verified) verified = true;
-    }
-
+    // check verification status (local)
+    const verified = !!userRecord.verified;
     if (!verified) {
       return res.status(403).json({ ok: false, error: 'not_verified' });
     }
 
-    // 4) success: mint a simple token and return
     const token = randomToken();
     tokenStore.set(token, { userId, issuedAt: Date.now() });
 
-    // build returned user object (keep minimal)
     const user = { id: userId, name: userRecord.name || (userRecord.id || userId), email: userRecord.email || null };
 
     return res.json({ ok: true, token, user });
@@ -444,9 +434,22 @@ app.get('/api/aircraft/status', async (req, res) => {
 // Optional: tiny cron-like pruning (best to run a separate cron job in production)
 setInterval(() => {
   pruneExpired().catch(console.error);
+  // also prune verification codes stored in-memory
+  pruneExpiredCodes().catch(console.error);
 }, 5 * 60 * 1000);
 
-// Graceful shutdown handling
+// helper wrapper to call pruneExpired (kept name for compatibility)
+async function pruneExpiredWrapper() {
+  // noop — actual prune handled below if needed
+}
+async function pruneExpiredCodes() {
+  await pruneExpired();
+}
+
+/* =========================
+   Graceful shutdown handling
+   ========================= */
+
 process.on('SIGTERM', () => {
   console.log('SIGTERM received, shutting down gracefully');
   aircraftService.shutdown();
@@ -459,14 +462,18 @@ process.on('SIGINT', () => {
   process.exit(0);
 });
 
-initDb().then(() => {
-  const server = app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-    
-    // Initialize aircraft tracking service
-    aircraftService.initialize(server);
-  });
-}).catch(err => {
-  console.error('DB init failed', err);
-  process.exit(1);
+/* =========================
+   Start server immediately (no DB)
+   ========================= */
+
+const server = app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  
+  // Initialize aircraft tracking service
+  aircraftService.initialize(server);
 });
+
+// Expose some utilities for debugging
+process._localVerificationCodes = codes;
+process._localUserStoreFile = USERS_FILE;
+
