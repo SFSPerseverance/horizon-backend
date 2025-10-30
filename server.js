@@ -75,7 +75,10 @@ const AircraftSchema = z.object({
   heading: z.number().min(0).max(360),
   altitude: z.number().optional(),
   speed: z.number().optional(),
-  aircraft_type: z.string().optional()
+  aircraft_type: z.string().optional(),
+  icao: z.string().optional(),
+  airframe: z.string().optional(),
+  subtype: z.string().optional(),
 });
 
 const AircraftArraySchema = z.array(AircraftSchema);
