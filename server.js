@@ -14,7 +14,6 @@ import aircraftService from './aircraftService.js';
 import { promises as fs } from 'fs';
 import path from 'path';
 import crypto from 'crypto';
-
 dotenv.config();
 
 const app = express();
