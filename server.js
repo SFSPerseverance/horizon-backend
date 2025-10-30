@@ -386,19 +386,6 @@ app.post('/api/login', async (req, res) => {
 // Roblox server posts aircraft data here
 // Must include header x-admin-token: <ADMIN_TOKEN>
 app.post('/api/aircraft', aircraftLimiter, async (req, res) => {
-   try {
-        console.log('Incoming aircraft payload:', JSON.stringify(req.body, null, 2));
-        const aircraftArray = AircraftArraySchema.parse(req.body);
-        const result = aircraftService.updateAircraft(aircraftArray);
-        res.json({ ok: true, ...result });
-    } catch (e) {
-        console.error('Aircraft update error:', e);
-        if (e instanceof z.ZodError) {
-            res.status(400).json({ ok: false, error: 'invalid_aircraft_data', details: e.errors });
-        } else {
-            res.status(500).json({ ok: false, error: 'server_error' });
-        }
-    }
   try {
     const token = req.header('x-admin-token') || '';
     if (!ADMIN_TOKEN || token !== ADMIN_TOKEN) {
@@ -494,4 +481,3 @@ const server = app.listen(PORT, () => {
 // Expose some utilities for debugging
 process._localVerificationCodes = codes;
 process._localUserStoreFile = USERS_FILE;
-
