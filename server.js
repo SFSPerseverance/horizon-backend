@@ -69,7 +69,7 @@ const SignupSchema = z.object({
 
 const AircraftSchema = z.object({
   id: z.string(),
-  owner: z.number().optional(),
+  pilot: z.number().optional(),
   callsign: z.string().optional(),
   latitude: z.number().min(-90).max(90),
   longitude: z.number().min(-180).max(180),
