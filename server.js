@@ -80,6 +80,8 @@ const AircraftSchema = z.object({
   icao: z.string().optional(),
   airframe: z.string().optional(),
   subtype: z.string().optional(),
+  serverId: z.string(),
+  airline: z.string(),
 });
 
 const AircraftArraySchema = z.array(AircraftSchema);
